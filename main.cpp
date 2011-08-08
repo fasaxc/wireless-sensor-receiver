@@ -77,24 +77,10 @@ static float filterx(float in)
 {
   static float xv[NZEROS+1], yv[NPOLES+1];
   xv[0] = xv[1]; xv[1] = xv[2];
-  xv[2] = in / 4.143204922e+03;
+  xv[2] = in / 1.058546241e+03;
   yv[0] = yv[1]; yv[1] = yv[2];
   yv[2] =   (xv[0] + xv[2]) + 2 * xv[1]
-                       + ( -0.9565436765 * yv[0]) + (  1.9555782403 * yv[1]);
-  return yv[2];
-}
-
-/**
- *
- */
-static float filtergyro(float in)
-{
-  static float xv[NZEROS+1], yv[NPOLES+1];
-  xv[0] = xv[1]; xv[1] = xv[2];
-  xv[2] = in / 1.000004443e+00;
-  yv[0] = yv[1]; yv[1] = yv[2];
-  yv[2] = (xv[0] + xv[2]) - 2 * xv[1]
-                          + ( -0.9999911143 * yv[0]) + (  1.9999911142 * yv[1]);
+                                     + ( -0.9149758348 * yv[0]) + (  1.9111970674 * yv[1]);
   return yv[2];
 }
 
@@ -145,6 +131,8 @@ ISR(TIMER1_COMPA_vect)
 #define NUM_G_SQ 3
   static float total_gs_sq[NUM_G_SQ];
   static int gs_idx = 0;
+  static float v_m_per_sec = 0;
+  static float displacement = 0;
 
   // Read the inputs.  Each analog read should take about 0.12 msec.  We can't
   // do too many analog reads per timer tick.
@@ -164,6 +152,10 @@ ISR(TIMER1_COMPA_vect)
   y_gs = ACCEL_G_PER_ADC_UNIT * (y_reading - 512);
 
   x_filt_gs = filterx(x_gs);
+
+  v_m_per_sec += (x_gs * 9.8 * TICK_SECONDS);
+  displacement *= 0.99;
+  displacement += v_m_per_sec * TICK_SECONDS;
 
   total_gs_sq[gs_idx++] = abs(1.0 - (x_raw_gs * x_raw_gs + y_gs * y_gs));
   if (gs_idx == NUM_G_SQ)
@@ -200,17 +192,19 @@ ISR(TIMER1_COMPA_vect)
         max_gs_sq = total_gs_sq[i];
       }
     }
-    float g_factor = max(0.0, 1.0 - (15 * max_gs_sq)) * 0.02;
+    float g_factor = max(0.01, 1.0 - (15 * max_gs_sq)) * 0.015;
 
     tilt_rads_estimate = (1.0 - g_factor) * (tilt_rads_estimate + gyro_rads_per_sec * TICK_SECONDS) +
                          g_factor * x_filt_gs;
     tilt_int_rads += tilt_rads_estimate * TICK_SECONDS;
 
-#define D_TILT_FACT 250.0
-#define TILT_FACT 20000.0
+#define D_TILT_FACT 150.0
+#define TILT_FACT 15000.0
 #define TILT_INT_FACT 20000.0
+#define V_FACT 100.0
+#define DISPLACEMENT_FACT 10000.0
 
-#define MAX_TILT_INT (0.2)
+#define MAX_TILT_INT (1.0)
 
     if (tilt_int_rads > MAX_TILT_INT)
     {
@@ -221,10 +215,17 @@ ISR(TIMER1_COMPA_vect)
       tilt_int_rads = -MAX_TILT_INT;
     }
 
+#define DISPLACEMENT_OFFSET 0.15
+    float displacement_fact = min(1.0,
+                                  abs(displacement) < DISPLACEMENT_OFFSET ?
+                                      0 :
+                                      (abs(displacement) - DISPLACEMENT_OFFSET));
 #ifndef CALIBRATION
     speed = tilt_rads_estimate * TILT_FACT +
             tilt_int_rads * TILT_INT_FACT +
-            gyro_rads_per_sec * D_TILT_FACT;
+            gyro_rads_per_sec * D_TILT_FACT +
+            v_m_per_sec * V_FACT * displacement_fact +
+            displacement * displacement_fact * DISPLACEMENT_FACT;
 #endif
     last_speed = speed;
 
@@ -238,25 +239,16 @@ ISR(TIMER1_COMPA_vect)
   digitalWrite(dir_a, speed < 0 ? LOW : HIGH);
   digitalWrite(dir_b, speed < 0 ? LOW : HIGH);
 
-  if (write_gyro && counter >= 100)
+  if (write_gyro && counter >= 10)
   {
-    Serial.print('g');
-    Serial.print(gyro_reading);
-    Serial.print(" o");
-    Serial.print(x_offset, 4);
-    Serial.print(" x");
     Serial.print(x_raw_gs, 4);
-    Serial.print(" y");
+    Serial.print(",");
     Serial.print(y_gs, 4);
-    Serial.print(" t");
-    Serial.print(max_gs_sq, 4);
-    Serial.print(" f");
+    Serial.print(",");
     Serial.print(gyro_rads_per_sec, 4);
-    Serial.print(" t");
+    Serial.print(",");
     Serial.print(tilt_rads_estimate, 4);
-    Serial.print(" i");
-    Serial.print(tilt_int_rads);
-    Serial.print(" s");
+    Serial.print(",");
     Serial.print(speed);
     Serial.print('\n');
     Serial.flush();
