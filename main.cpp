@@ -19,6 +19,7 @@
 #include "cppboilerplate.h"
 #include <avr/interrupt.h>
 #include <util/atomic.h>
+#include <EEPROM.h>
 
 #define TARGET_LOOP_HZ (1000)
 #define TICKS_PER_LOOP (F_CPU / TARGET_LOOP_HZ)
@@ -47,6 +48,10 @@
 #define ACCEL_V_PER_G (1.011)
 #define ACCEL_G_PER_ADC_UNIT (V_PER_ADC_UNIT / ACCEL_V_PER_G)
 
+// EEPROM addresses
+#define GYRO_OFFSET_ADDR 0
+#define NEXT_ADDR (GYRO_OFFSET_ADDR + sizeof(float))
+
 // Pin definitions
 const int led_pin = 7;
 const int pwm_a = 3;   // PWM control for motor outputs 1 and 2 is on digital pin 3
@@ -56,8 +61,10 @@ const int dir_b = 13;  // direction control for motor outputs 3 and 4 is on digi
 const int x_pin = A0;
 const int y_pin = A1;
 const int gyro_pin = A2;
+const int switch_pin = 8;  // Pin connected to our active-low push switch.  Assumed to be
+                           // PORTB 0 below when enabling the internal pullup.
 
-const float GYRO_OFFSET = 3.982;
+const float GYRO_OFFSET = 3.982 * GYRO_RAD_PER_ADC_UNIT;
 const float X_OFFSET = 8;    // More negative tilts forwards
 
 //#define CALIBRATION
@@ -68,6 +75,30 @@ const float X_OFFSET = 8;    // More negative tilts forwards
 
 #define NZEROS 2
 #define NPOLES 2
+
+union floatbytes
+{
+  char bytes[sizeof(float)];
+  float val;
+} floatbytes;
+
+static void write_float_to_eeprom(int addr, float f)
+{
+  floatbytes.val = f;
+  for (unsigned int i = 0; i < sizeof(float); i++)
+  {
+    EEPROM.write(addr + i, floatbytes.bytes[i]);
+  }
+}
+
+static float read_float_from_eeprom(int addr)
+{
+  for (unsigned int i = 0; i < sizeof(float); i++)
+  {
+    floatbytes.bytes[i] = EEPROM.read(addr + i);
+  }
+  return floatbytes.val;
+}
 
 /**
  * Low pass filter. Created via
@@ -112,6 +143,7 @@ static uint8_t error = 0;
 static long int max_timer = 0;
 
 static bool write_gyro = false;
+static float gyro_offset = GYRO_OFFSET;
 
 /**
  * (Timer 1 == OCR1A) interrupt handler.  Called each time timer 1 hits the top
@@ -133,6 +165,7 @@ ISR(TIMER1_COMPA_vect)
   static int gs_idx = 0;
   static float v_m_per_sec = 0;
   static float displacement = 0;
+  static int calibration_counter = 0;
 
   // Read the inputs.  Each analog read should take about 0.12 msec.  We can't
   // do too many analog reads per timer tick.
@@ -144,9 +177,8 @@ ISR(TIMER1_COMPA_vect)
   y_reading = analogRead(y_pin);
 
   // Convert to sensible units
-  float gyro_offset = ((gyro_offset_pot - 512) * 0.1);
   float x_offset = ((x_offset_pot - 512) * 0.1);
-  gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading + gyro_offset);
+  gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading) + gyro_offset;
   x_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512 + x_offset);
   float x_raw_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512);
   y_gs = ACCEL_G_PER_ADC_UNIT * (y_reading - 512);
@@ -157,7 +189,8 @@ ISR(TIMER1_COMPA_vect)
   displacement *= 0.99;
   displacement += v_m_per_sec * TICK_SECONDS;
 
-  total_gs_sq[gs_idx++] = abs(1.0 - (x_raw_gs * x_raw_gs + y_gs * y_gs));
+  float gs_sq = (x_raw_gs * x_raw_gs + y_gs * y_gs);
+  total_gs_sq[gs_idx++] = abs(1.0 - gs_sq);
   if (gs_idx == NUM_G_SQ)
   {
     gs_idx = 0;
@@ -165,7 +198,33 @@ ISR(TIMER1_COMPA_vect)
 
   float max_gs_sq = 0;
 
-  if (y_gs < 0.1 && abs(x_filt_gs) > 0.6)
+  static long int calibration_readings;
+  static float sum_gyro;
+
+  if (digitalRead(switch_pin) == LOW && calibration_counter == 0)
+  {
+    // The switch was pressed, start the calibration counter
+    Serial.print("Beginning calibration\n");
+    calibration_counter = 10 * TARGET_LOOP_HZ;
+    calibration_readings = 0;
+    sum_gyro = 0;
+  }
+
+  if (calibration_counter == 1)
+  {
+    gyro_offset = sum_gyro / calibration_readings;
+    Serial.print("New gyro offset: ");
+    Serial.print(gyro_offset, 4);
+    Serial.print('\n');
+    Serial.flush();
+    write_float_to_eeprom(GYRO_OFFSET_ADDR, gyro_offset);
+  }
+  else if (calibration_counter > 0 && calibration_counter < 8 * TARGET_LOOP_HZ)
+  {
+    sum_gyro += GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading);
+    calibration_readings++;
+  }
+  else if (y_gs < 0.1 && abs(x_filt_gs) > 0.6)
   {
     // We fell over! Shut off the motors.
     speed = 0;
@@ -177,6 +236,9 @@ ISR(TIMER1_COMPA_vect)
     if (-0.02 < x_gs && x_gs < 0.02)
     {
       tilt_rads_estimate = x_gs;
+      speed = 0;
+      v_m_per_sec = 0;
+      displacement = 0;
       tilt_int_rads = 0;
       reset_complete = true;
     }
@@ -220,13 +282,11 @@ ISR(TIMER1_COMPA_vect)
                                   abs(displacement) < DISPLACEMENT_OFFSET ?
                                       0 :
                                       (abs(displacement) - DISPLACEMENT_OFFSET));
-#ifndef CALIBRATION
     speed = tilt_rads_estimate * TILT_FACT +
             tilt_int_rads * TILT_INT_FACT +
             gyro_rads_per_sec * D_TILT_FACT +
             v_m_per_sec * V_FACT * displacement_fact +
             displacement * displacement_fact * DISPLACEMENT_FACT;
-#endif
     last_speed = speed;
 
     if (TCNT1 > max_timer)
@@ -306,6 +366,11 @@ ISR(TIMER1_COMPA_vect)
     error = 1;
   }
   loop_count++;
+
+  if (calibration_counter > 0)
+  {
+    calibration_counter--;
+  }
 }
 
 void setup()
@@ -315,10 +380,22 @@ void setup()
   pinMode(dir_a, OUTPUT);
   pinMode(dir_b, OUTPUT);
 
+  // Turn on the internal pullup for our switch input.
+  pinMode(switch_pin, INPUT);
+  PORTB |= _BV(PORTB0);
+
   analogWrite(pwm_a, 0);
   analogWrite(pwm_b, 0);
 
+  // configure serial port for comms with BlueSMIRF.
   Serial.begin(115200);
+
+  // Read calibration data from EEPROM
+  gyro_offset = read_float_from_eeprom(GYRO_OFFSET_ADDR);
+  if (!(gyro_offset < 0.5 && gyro_offset > -0.5))
+  {
+    gyro_offset = GYRO_OFFSET;
+  }
 
   // Timer0 PWM
   TCCR0B = (TCCR0B & 0xf8) | _BV(CS02);
@@ -338,18 +415,13 @@ void setup()
 }
 void loop()
 {
-#ifdef CALIBRATION
-  ATOMIC_BLOCK(ATOMIC_FORCEON)
-  {
-    myprintf("Gyro: %d, X: %d, Y: %d\r", gyro_reading, x_reading, y_reading);
-    myprintf("A3: %d, A4: %d, A5: %d\r", analogRead(A3), analogRead(A4), analogRead(A5));
-  }
-  delay(500);
-#endif
   int c = Serial.read();
   {
     if (c == 'g')
     {
+      Serial.print("Gyro offset: ");
+      Serial.print(gyro_offset, 4);
+      Serial.print('\n');
       write_gyro = true;
     }
   }

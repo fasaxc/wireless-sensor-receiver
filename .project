@@ -81,4 +81,11 @@
 		<nature>org.eclipse.cdt.managedbuilder.core.ScannerConfigNature</nature>
 		<nature>de.innot.avreclipse.core.avrnature</nature>
 	</natures>
+	<linkedResources>
+		<link>
+			<name>eeprom</name>
+			<type>2</type>
+			<location>/home/shaun/opt/arduino-0022/libraries/EEPROM</location>
+		</link>
+	</linkedResources>
 </projectDescription>

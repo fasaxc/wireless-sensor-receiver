@@ -44,6 +44,7 @@
 								<option id="de.innot.avreclipse.cppcompiler.option.optimize.1975591050" name="Optimization Level" superClass="de.innot.avreclipse.cppcompiler.option.optimize" value="de.innot.avreclipse.cppcompiler.optimize.size" valueType="enumerated"/>
 								<option id="de.innot.avreclipse.cppcompiler.option.incpath.881439997" name="Include Paths (-I)" superClass="de.innot.avreclipse.cppcompiler.option.incpath" valueType="includePath">
 									<listOptionValue builtIn="false" value="/home/shaun/opt/arduino-0022/hardware/arduino/cores/arduino"/>
+									<listOptionValue builtIn="false" value="/home/shaun/opt/arduino-0022/libraries/EEPROM"/>
 								</option>
 								<option id="de.innot.avreclipse.cppcompiler.option.optimize.other.1971223590" name="Other Optimization Flags" superClass="de.innot.avreclipse.cppcompiler.option.optimize.other" value="-ffunction-sections -fdata-sections -ffast-math -Wl,--gc-sections" valueType="string"/>
 								<inputType id="de.innot.avreclipse.cppcompiler.input.317572352" superClass="de.innot.avreclipse.cppcompiler.input"/>
@@ -69,6 +70,10 @@
 							<tool commandLinePattern="${COMMAND} ${FLAGS}" id="de.innot.avreclipse.tool.avrdude.app.debug.424724807" name="AVRDude" superClass="de.innot.avreclipse.tool.avrdude.app.debug"/>
 						</toolChain>
 					</folderInfo>
+					<sourceEntries>
+						<entry excluding="eeprom" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="eeprom"/>
+					</sourceEntries>
 				</configuration>
 			</storageModule>
 			<storageModule moduleId="org.eclipse.cdt.core.externalSettings"/>
