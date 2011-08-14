@@ -45,12 +45,14 @@
 //
 // The accelerometer is ratiometric with Vs but it doesn't use the full range
 // from GND to Vs.  At 5V, it reads about 1V per g.
-#define ACCEL_V_PER_G (1.011)
+#define ACCEL_V_PER_G (1.0)
 #define ACCEL_G_PER_ADC_UNIT (V_PER_ADC_UNIT / ACCEL_V_PER_G)
 
 // EEPROM addresses
 #define GYRO_OFFSET_ADDR 0
-#define NEXT_ADDR (GYRO_OFFSET_ADDR + sizeof(float))
+#define GYRO_OFFSET_SIZE sizeof(float)
+#define ACCEL_FACT_ADDR (GYRO_OFFSET_ADDR + GYRO_OFFSET_SIZE)
+#define ACCEL_FACT_SIZE sizeof(float)
 
 // Pin definitions
 const int led_pin = 7;
@@ -111,7 +113,17 @@ static float filterx(float in)
   xv[2] = in / 1.058546241e+03;
   yv[0] = yv[1]; yv[1] = yv[2];
   yv[2] =   (xv[0] + xv[2]) + 2 * xv[1]
-                                     + ( -0.9149758348 * yv[0]) + (  1.9111970674 * yv[1]);
+                          + ( -0.9149758348 * yv[0]) + (  1.9111970674 * yv[1]);
+  return yv[2];
+}
+static float filtery(float in)
+{
+  static float xv[NZEROS+1], yv[NPOLES+1];
+  xv[0] = xv[1]; xv[1] = xv[2];
+  xv[2] = in / 1.058546241e+03;
+  yv[0] = yv[1]; yv[1] = yv[2];
+  yv[2] =   (xv[0] + xv[2]) + 2 * xv[1]
+                          + ( -0.9149758348 * yv[0]) + (  1.9111970674 * yv[1]);
   return yv[2];
 }
 
@@ -136,14 +148,16 @@ static int y_reading = 0;
 static float last_speed = 0;
 static float tilt_rads_estimate = 0;
 static float x_filt_gs = 0;
+static float y_filt_gs = 0;
 static float tilt_int_rads = 0;
 static boolean reset_complete = false;
 static long int loop_count = 0;
 static uint8_t error = 0;
 static long int max_timer = 0;
 
-static bool write_gyro = false;
+static volatile bool write_gyro = false;
 static float gyro_offset = GYRO_OFFSET;
+static float accel_fact = 1.0;
 
 /**
  * (Timer 1 == OCR1A) interrupt handler.  Called each time timer 1 hits the top
@@ -177,20 +191,24 @@ ISR(TIMER1_COMPA_vect)
   y_reading = analogRead(y_pin);
 
   // Convert to sensible units
-  float x_offset = ((x_offset_pot - 512) * 0.1);
-  gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading) + gyro_offset;
-  x_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512 + x_offset);
-  float x_raw_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512);
+  float accel_rotation = ((x_offset_pot - 512) * 0.001);
+  gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading) - gyro_offset;
+  x_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512);
   y_gs = ACCEL_G_PER_ADC_UNIT * (y_reading - 512);
 
-  x_filt_gs = filterx(x_gs);
+  x_filt_gs = filterx(x_gs) * accel_fact;
+  y_filt_gs = filtery(y_gs) * accel_fact;
 
-  v_m_per_sec += (x_gs * 9.8 * TICK_SECONDS);
+  float accel_tilt_estimate = x_filt_gs * cos(accel_rotation) -
+                              y_filt_gs * sin(accel_rotation);
+
+  v_m_per_sec *= 0.99;
+  v_m_per_sec += (accel_tilt_estimate * 9.8 * TICK_SECONDS);
   displacement *= 0.99;
   displacement += v_m_per_sec * TICK_SECONDS;
 
-  float gs_sq = (x_raw_gs * x_raw_gs + y_gs * y_gs);
-  total_gs_sq[gs_idx++] = abs(1.0 - gs_sq);
+  float gs_sq = (x_gs * x_gs + y_gs * y_gs);
+  total_gs_sq[gs_idx++] = abs(1.0 - gs_sq * accel_fact * accel_fact);
   if (gs_idx == NUM_G_SQ)
   {
     gs_idx = 0;
@@ -200,6 +218,7 @@ ISR(TIMER1_COMPA_vect)
 
   static long int calibration_readings;
   static float sum_gyro;
+  static float sum_gs;
 
   if (digitalRead(switch_pin) == LOW && calibration_counter == 0)
   {
@@ -208,6 +227,7 @@ ISR(TIMER1_COMPA_vect)
     calibration_counter = 10 * TARGET_LOOP_HZ;
     calibration_readings = 0;
     sum_gyro = 0;
+    sum_gs = 0;
   }
 
   if (calibration_counter == 1)
@@ -218,10 +238,18 @@ ISR(TIMER1_COMPA_vect)
     Serial.print('\n');
     Serial.flush();
     write_float_to_eeprom(GYRO_OFFSET_ADDR, gyro_offset);
+
+    accel_fact = 1.0 / (sum_gs / calibration_readings);
+    Serial.print("New accelerometer factor: ");
+    Serial.print(accel_fact, 4);
+    Serial.print('\n');
+    Serial.flush();
+    write_float_to_eeprom(ACCEL_FACT_ADDR, accel_fact);
   }
   else if (calibration_counter > 0 && calibration_counter < 8 * TARGET_LOOP_HZ)
   {
     sum_gyro += GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading);
+    sum_gs += sqrt(gs_sq);
     calibration_readings++;
   }
   else if (y_gs < 0.1 && abs(x_filt_gs) > 0.6)
@@ -254,14 +282,14 @@ ISR(TIMER1_COMPA_vect)
         max_gs_sq = total_gs_sq[i];
       }
     }
-    float g_factor = max(0.01, 1.0 - (15 * max_gs_sq)) * 0.015;
-
+    float g_factor = 0.0005;
     tilt_rads_estimate = (1.0 - g_factor) * (tilt_rads_estimate + gyro_rads_per_sec * TICK_SECONDS) +
-                         g_factor * x_filt_gs;
+                         g_factor * accel_tilt_estimate;
+    tilt_int_rads *= 0.9995;
     tilt_int_rads += tilt_rads_estimate * TICK_SECONDS;
 
 #define D_TILT_FACT 150.0
-#define TILT_FACT 15000.0
+#define TILT_FACT 20000.0
 #define TILT_INT_FACT 20000.0
 #define V_FACT 100.0
 #define DISPLACEMENT_FACT 10000.0
@@ -301,14 +329,16 @@ ISR(TIMER1_COMPA_vect)
 
   if (write_gyro && counter >= 10)
   {
-    Serial.print(x_raw_gs, 4);
-    Serial.print(",");
-    Serial.print(y_gs, 4);
-    Serial.print(",");
-    Serial.print(gyro_rads_per_sec, 4);
-    Serial.print(",");
+    Serial.print(accel_tilt_estimate, 4);
+    Serial.print("\t");
     Serial.print(tilt_rads_estimate, 4);
-    Serial.print(",");
+    Serial.print("\t");
+    Serial.print(tilt_int_rads, 4);
+    Serial.print("\t");
+    Serial.print(v_m_per_sec, 4);
+    Serial.print("\t");
+    Serial.print(displacement);
+    Serial.print("\t");
     Serial.print(speed);
     Serial.print('\n');
     Serial.flush();
@@ -361,16 +391,16 @@ ISR(TIMER1_COMPA_vect)
       digitalWrite(led_pin, !digitalRead(led_pin));
     }
   }
-  if (TCNT1 > TICKS_PER_LOOP)
-  {
-    error = 1;
-  }
-  loop_count++;
 
   if (calibration_counter > 0)
   {
     calibration_counter--;
   }
+  if (TCNT1 > TICKS_PER_LOOP)
+  {
+    error = 1;
+  }
+  loop_count++;
 }
 
 void setup()
@@ -396,6 +426,11 @@ void setup()
   {
     gyro_offset = GYRO_OFFSET;
   }
+  accel_fact = read_float_from_eeprom(ACCEL_FACT_ADDR);
+  if (!(accel_fact < 1.5 && accel_fact > 0.5))
+  {
+    accel_fact = 1.0;
+  }
 
   // Timer0 PWM
   TCCR0B = (TCCR0B & 0xf8) | _BV(CS02);
@@ -416,13 +451,14 @@ void setup()
 void loop()
 {
   int c = Serial.read();
+  if (c == 'g')
   {
-    if (c == 'g')
-    {
-      Serial.print("Gyro offset: ");
-      Serial.print(gyro_offset, 4);
-      Serial.print('\n');
-      write_gyro = true;
-    }
+    Serial.print("Gyro offset: ");
+    Serial.print(gyro_offset, 4);
+    Serial.print('\n');
+    Serial.print("Accel fact: ");
+    Serial.print(accel_fact, 4);
+    Serial.print('\n');
+    write_gyro = true;
   }
 }
