@@ -202,7 +202,7 @@ ISR(TIMER1_COMPA_vect)
   float accel_tilt_estimate = x_filt_gs * cos(accel_rotation) -
                               y_filt_gs * sin(accel_rotation);
 
-  v_m_per_sec *= 0.99;
+  v_m_per_sec *= 0.999;
   v_m_per_sec += (accel_tilt_estimate * 9.8 * TICK_SECONDS);
   displacement *= 0.99;
   displacement += v_m_per_sec * TICK_SECONDS;
@@ -285,16 +285,15 @@ ISR(TIMER1_COMPA_vect)
     float g_factor = 0.0005;
     tilt_rads_estimate = (1.0 - g_factor) * (tilt_rads_estimate + gyro_rads_per_sec * TICK_SECONDS) +
                          g_factor * accel_tilt_estimate;
-    tilt_int_rads *= 0.9995;
     tilt_int_rads += tilt_rads_estimate * TICK_SECONDS;
 
-#define D_TILT_FACT 150.0
+#define D_TILT_FACT 200.0
 #define TILT_FACT 20000.0
-#define TILT_INT_FACT 20000.0
-#define V_FACT 100.0
-#define DISPLACEMENT_FACT 10000.0
+#define TILT_INT_FACT 25000.0
+#define V_FACT 0 // 100.0
+#define DISPLACEMENT_FACT 0 // 10000.0
 
-#define MAX_TILT_INT (1.0)
+#define MAX_TILT_INT (0.1)
 
     if (tilt_int_rads > MAX_TILT_INT)
     {
