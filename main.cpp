@@ -206,7 +206,6 @@ ISR(TIMER1_COMPA_vect)
   x_reading = analogRead(x_pin);
   y_reading = analogRead(y_pin);
 
-
   // Convert readings to real units.
   gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading) - gyro_offset;
   x_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512);
@@ -311,12 +310,13 @@ ISR(TIMER1_COMPA_vect)
     tilt_int_rads += tilt_rads_estimate * TICK_SECONDS;
 
 #define D_TILT_FACT 200.0
-#define TILT_FACT 15000.0
-#define TILT_INT_FACT 45000.0
+#define TILT_FACT 5000.0
+#define TILT_SQ_FACT 50000.0
+#define TILT_INT_FACT 50000.0
 #define V_FACT 0 // 100.0
 #define DISPLACEMENT_FACT 0 // 10000.0
 
-#define MAX_TILT_INT (0.01)
+#define MAX_TILT_INT (0.015)
 
     if (tilt_int_rads > MAX_TILT_INT)
     {
@@ -333,11 +333,11 @@ ISR(TIMER1_COMPA_vect)
                                       0 :
                                       (abs(displacement) - DISPLACEMENT_OFFSET));
     speed = tilt_rads_estimate * TILT_FACT +
+            tilt_rads_estimate * abs(tilt_rads_estimate) * TILT_SQ_FACT +
             tilt_int_rads * TILT_INT_FACT +
             gyro_rads_per_sec * D_TILT_FACT +
             v_m_per_sec * V_FACT * displacement_fact +
             displacement * displacement_fact * DISPLACEMENT_FACT;
-    last_speed = speed;
 
     if (TCNT1 > max_timer)
     {
@@ -372,14 +372,14 @@ ISR(TIMER1_COMPA_vect)
   }
 
   // Set the motor speeds.
-  speed = 7 * sqrt(abs(speed));
-  if (speed > 0xff)
+  float abs_speed = 7 * sqrt(abs(speed));
+  if (abs_speed > 0xff)
   {
-    speed = 0xff;
+    abs_speed = 0xff;
   }
 
-  motor_a_speed = (long int)(speed * MOTOR_A_FACTOR);
-  motor_b_speed = (long int)(speed * MOTOR_B_FACTOR);
+  motor_a_speed = (long int)(abs_speed * MOTOR_A_FACTOR);
+  motor_b_speed = (long int)(abs_speed * MOTOR_B_FACTOR);
 
   if (motor_a_speed > 0xff)
   {
@@ -392,6 +392,8 @@ ISR(TIMER1_COMPA_vect)
 
   analogWrite(pwm_a, motor_a_speed);
   analogWrite(pwm_b, motor_b_speed);
+
+  last_speed = speed;
 
   // Read the adjustment pots about once per second.  Stagger the reads to
   // avoid doing too many time-consuming reads in one loop.
