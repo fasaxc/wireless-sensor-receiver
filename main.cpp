@@ -32,19 +32,17 @@
 
 // Calculate the scaling factor from gyro ADC reading to radians.  The gyro is
 // ratiometric with Vs but it doesn't use the full range.
+#define RADIANS_PER_DEGREE 0.0174532925
 #define V_PER_ADC_UNIT (5.0 / ADC_RANGE)
-#define GYRO_MAX_DEG_PER_SEC (150.0)
-#define GYRO_V_PER_DEG_PER_SEC (12.5 / 1000.0)
-// Swing at 5V
+#define GYRO_MAX_DEG_PER_SEC (150.0)      // From gyro datasheet
+#define GYRO_V_PER_DEG_PER_SEC (0.01125)  // Calibrated value from datasheet.
 #define GYRO_DEG_PER_ADC_UNIT (V_PER_ADC_UNIT / GYRO_V_PER_DEG_PER_SEC)
-#define GYRO_RAD_PER_ADC_UNIT (GYRO_DEG_PER_ADC_UNIT * 0.0174532925)
+#define GYRO_RAD_PER_ADC_UNIT (GYRO_DEG_PER_ADC_UNIT * RADIANS_PER_DEGREE)
 
-// Calculate the scaling factor from ADC readings to g.  We use the g reading
-// from X-axis sensor as an approximation for the tilt angle (since, for small
-// angles sin(x) (which the accelerometer measures) is approximately equal to x.
+// Calculate the scaling factor from ADC readings to g.
 //
 // The accelerometer is ratiometric with Vs but it doesn't use the full range
-// from GND to Vs.  At 5V, it reads about 1V per g.
+// from GND to Vs.  At Vs = 5V, it reads about 1V per g.
 #define ACCEL_V_PER_G (1.0)
 #define ACCEL_G_PER_ADC_UNIT (V_PER_ADC_UNIT / ACCEL_V_PER_G)
 
@@ -66,18 +64,17 @@ const int gyro_pin = A2;
 const int switch_pin = 8;  // Pin connected to our active-low push switch.  Assumed to be
                            // PORTB 0 below when enabling the internal pullup.
 
+// Default gyro offset used if no calibration has been done.  Unique to each
+// gyro.
 const float GYRO_OFFSET = 3.982 * GYRO_RAD_PER_ADC_UNIT;
-const float X_OFFSET = 8;    // More negative tilts forwards
-
-//#define CALIBRATION
 
 // Allowances for mechanical differences in motors
 #define MOTOR_A_FACTOR 1
 #define MOTOR_B_FACTOR 1
 
-#define NZEROS 2
-#define NPOLES 2
-
+/**
+ * Union used to convert from float to bytes and back again.
+ */
 union floatbytes
 {
   char bytes[sizeof(float)];
@@ -101,6 +98,10 @@ static float read_float_from_eeprom(int addr)
   }
   return floatbytes.val;
 }
+
+// Filter orders.
+#define NZEROS 2
+#define NPOLES 2
 
 /**
  * Low pass filter. Created via
@@ -140,24 +141,54 @@ void myprintf(const char *fmt, ... ){
 static int d_tilt_pot = 512;
 static int x_offset_pot = 512;
 static int gyro_offset_pot = 512;
-
+// Raw 0-ADC_RANGE readings from the sensors.
 static int gyro_reading = 0;
 static int x_reading = 0;
 static int y_reading = 0;
-
-static float last_speed = 0;
-static float tilt_rads_estimate = 0;
+// Gyro rate converted to rads per sec.
+static float gyro_rads_per_sec;
+// Unfiltered accelerometer values in g.
+static float y_gs;
+static float x_gs;
+// Filtered accelerometer readings in g.
 static float x_filt_gs = 0;
 static float y_filt_gs = 0;
+// Best estimate of the curent tilt.
+static float tilt_rads_estimate = 0;
+// Integral of tilt.
 static float tilt_int_rads = 0;
+// Estimates of velocity and displacement.
+static float v_m_per_sec = 0;
+static float displacement = 0;
+// Calculated speed.
+static float speed = 0;
+// Individual speeds applied to each motor.
+static long int motor_a_speed = 0;
+static long int motor_b_speed = 0;
+// Value we used for the speed in the previous iteration.
+static float last_speed = 0;
+// true once the bot is standing up.
 static boolean reset_complete = false;
+// Counter, used to schedule work that we only do once in a while.
 static long int loop_count = 0;
-static uint8_t error = 0;
+// true if an error has occurred like a timer overflow.
+static boolean error = false;
+// High water mark for timer values at the end of our ISR.
 static long int max_timer = 0;
-
+// True if the timer handler should periodically write out debugging information
+// to the serial line.
 static volatile bool write_gyro = false;
+// Current gyroscope offset.  Set through calibration.
 static float gyro_offset = GYRO_OFFSET;
+// Current calibration factor applied to the accelerometer values.
 static float accel_fact = 1.0;
+// Loop counters.
+static uint16_t counter = 0;
+static int calibration_counter = 0;
+// Ring buffer tracking last few g sq values.
+#define NUM_G_SQ 3
+static float total_gs_sq[NUM_G_SQ];
+static int gs_idx = 0;
 
 /**
  * (Timer 1 == OCR1A) interrupt handler.  Called each time timer 1 hits the top
@@ -167,40 +198,32 @@ static float accel_fact = 1.0;
  */
 ISR(TIMER1_COMPA_vect)
 {
-  float y_gs;
-  float x_gs;
-  float gyro_rads_per_sec;
-  float speed = 0;
-  long int motor_a_speed = 0;
-  long int motor_b_speed = 0;
-  static uint16_t counter = 0;
-#define NUM_G_SQ 3
-  static float total_gs_sq[NUM_G_SQ];
-  static int gs_idx = 0;
-  static float v_m_per_sec = 0;
-  static float displacement = 0;
-  static int calibration_counter = 0;
-
   // Read the inputs.  Each analog read should take about 0.12 msec.  We can't
   // do too many analog reads per timer tick.
-
   // Gyro rate.
   gyro_reading = analogRead(gyro_pin);
   // Accelerometer
   x_reading = analogRead(x_pin);
   y_reading = analogRead(y_pin);
 
-  // Convert to sensible units
-  float accel_rotation = ((x_offset_pot - 512) * 0.001);
+
+  // Convert readings to real units.
   gyro_rads_per_sec =  GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading) - gyro_offset;
   x_gs = ACCEL_G_PER_ADC_UNIT * (x_reading - 512);
   y_gs = ACCEL_G_PER_ADC_UNIT * (y_reading - 512);
 
+  // Filter the inputs from the accelerometer to try to reduce the impact of
+  // vibration and acceleration from any movements the bot is making.
   x_filt_gs = filterx(x_gs) * accel_fact;
   y_filt_gs = filtery(y_gs) * accel_fact;
 
-  float accel_tilt_estimate = x_filt_gs * cos(accel_rotation) -
-                              y_filt_gs * sin(accel_rotation);
+  // Our constant rotation to apply to the accelerometer.  Sets the 0-tilt
+  // angle.
+  float accel_rotation = ((x_offset_pot - 512) * 0.001);
+
+  // Estimate the tilt from the accelerometer alone.  We'll factor in a fraction
+  // of this below.
+  float accel_tilt_estimate = asin(max(min(x_filt_gs, 1.0), -1.0)) + accel_rotation;
 
   v_m_per_sec *= 0.999;
   v_m_per_sec += (accel_tilt_estimate * 9.8 * TICK_SECONDS);
@@ -216,7 +239,7 @@ ISR(TIMER1_COMPA_vect)
 
   float max_gs_sq = 0;
 
-  static long int calibration_readings;
+  static long int num_cal_readings;
   static float sum_gyro;
   static float sum_gs;
 
@@ -225,21 +248,22 @@ ISR(TIMER1_COMPA_vect)
     // The switch was pressed, start the calibration counter
     Serial.print("Beginning calibration\n");
     calibration_counter = 10 * TARGET_LOOP_HZ;
-    calibration_readings = 0;
+    num_cal_readings = 0;
     sum_gyro = 0;
     sum_gs = 0;
   }
 
   if (calibration_counter == 1)
   {
-    gyro_offset = sum_gyro / calibration_readings;
+    // Calibration complete, calculate the results.
+    gyro_offset = sum_gyro / num_cal_readings;
     Serial.print("New gyro offset: ");
     Serial.print(gyro_offset, 4);
     Serial.print('\n');
     Serial.flush();
     write_float_to_eeprom(GYRO_OFFSET_ADDR, gyro_offset);
 
-    accel_fact = 1.0 / (sum_gs / calibration_readings);
+    accel_fact = 1.0 / (sum_gs / num_cal_readings);
     Serial.print("New accelerometer factor: ");
     Serial.print(accel_fact, 4);
     Serial.print('\n');
@@ -248,9 +272,17 @@ ISR(TIMER1_COMPA_vect)
   }
   else if (calibration_counter > 0 && calibration_counter < 8 * TARGET_LOOP_HZ)
   {
+    // We're running a calibration and we've let some time pass since the
+    // calibration started to let values settle.  Accumulate data.
+    //
+    // While calibrating, we should be still so finding the average gyro value
+    // should give us its null point.
     sum_gyro += GYRO_RAD_PER_ADC_UNIT * (512 - gyro_reading);
+
+    // Since we're still, the accelerometer should be measuring exactly 1G of
+    // force.  Sum its magnitude so we can calculate the average.
     sum_gs += sqrt(gs_sq);
-    calibration_readings++;
+    num_cal_readings++;
   }
   else if (y_gs < 0.1 && abs(x_filt_gs) > 0.6)
   {
@@ -263,7 +295,7 @@ ISR(TIMER1_COMPA_vect)
     // We've never been upright, wait until we're righted by the user.
     if (-0.02 < x_gs && x_gs < 0.02)
     {
-      tilt_rads_estimate = x_gs;
+      tilt_rads_estimate = accel_tilt_estimate;
       speed = 0;
       v_m_per_sec = 0;
       displacement = 0;
@@ -273,27 +305,18 @@ ISR(TIMER1_COMPA_vect)
   }
   else
   {
-    // The accelerometer isn't trustworthy if it's not reporting about 1G of
-    // force (it must be picking up acceleration from the motors).
-    for (int i = 0; i < NUM_G_SQ; i++)
-    {
-      if (total_gs_sq[i] > max_gs_sq)
-      {
-        max_gs_sq = total_gs_sq[i];
-      }
-    }
-    float g_factor = 0.0005;
+    const float g_factor = 0.0005;
     tilt_rads_estimate = (1.0 - g_factor) * (tilt_rads_estimate + gyro_rads_per_sec * TICK_SECONDS) +
                          g_factor * accel_tilt_estimate;
     tilt_int_rads += tilt_rads_estimate * TICK_SECONDS;
 
 #define D_TILT_FACT 200.0
-#define TILT_FACT 20000.0
-#define TILT_INT_FACT 25000.0
+#define TILT_FACT 15000.0
+#define TILT_INT_FACT 45000.0
 #define V_FACT 0 // 100.0
 #define DISPLACEMENT_FACT 0 // 10000.0
 
-#define MAX_TILT_INT (0.1)
+#define MAX_TILT_INT (0.01)
 
     if (tilt_int_rads > MAX_TILT_INT)
     {
@@ -348,6 +371,7 @@ ISR(TIMER1_COMPA_vect)
     counter ++;
   }
 
+  // Set the motor speeds.
   speed = 7 * sqrt(abs(speed));
   if (speed > 0xff)
   {
@@ -369,6 +393,8 @@ ISR(TIMER1_COMPA_vect)
   analogWrite(pwm_a, motor_a_speed);
   analogWrite(pwm_b, motor_b_speed);
 
+  // Read the adjustment pots about once per second.  Stagger the reads to
+  // avoid doing too many time-consuming reads in one loop.
   if (loop_count == TARGET_LOOP_HZ / 3)
   {
     d_tilt_pot = analogRead(A3);
@@ -383,10 +409,12 @@ ISR(TIMER1_COMPA_vect)
     loop_count = 0;
     if (error)
     {
+      // There's been an error, turn on our status LED permanently.
       digitalWrite(led_pin, HIGH);
     }
     else
     {
+      // No error, toggle the status LED once per second as a heartbeat.
       digitalWrite(led_pin, !digitalRead(led_pin));
     }
   }
@@ -397,14 +425,20 @@ ISR(TIMER1_COMPA_vect)
   }
   if (TCNT1 > TICKS_PER_LOOP)
   {
-    error = 1;
+    // This loop took too long and the timer wrapped.  That means that our
+    // timing will be incorrect.
+    error = true;
   }
   loop_count++;
 }
 
+/**
+ * Start-of-day initialization.
+ */
 void setup()
 {
-  pinMode(pwm_a, OUTPUT);  //Set control pins to be outputs
+  // Set control pins to be outputs
+  pinMode(pwm_a, OUTPUT);
   pinMode(pwm_b, OUTPUT);
   pinMode(dir_a, OUTPUT);
   pinMode(dir_b, OUTPUT);
@@ -413,21 +447,25 @@ void setup()
   pinMode(switch_pin, INPUT);
   PORTB |= _BV(PORTB0);
 
+  // Turn off the motors for now.
   analogWrite(pwm_a, 0);
   analogWrite(pwm_b, 0);
 
-  // configure serial port for comms with BlueSMIRF.
+  // Configure serial port for comms with BlueSMIRF.  It defaults to 115200
+  // baud.
   Serial.begin(115200);
 
   // Read calibration data from EEPROM
   gyro_offset = read_float_from_eeprom(GYRO_OFFSET_ADDR);
   if (!(gyro_offset < 0.5 && gyro_offset > -0.5))
   {
+    // Data didn't look sane, us a default.
     gyro_offset = GYRO_OFFSET;
   }
   accel_fact = read_float_from_eeprom(ACCEL_FACT_ADDR);
   if (!(accel_fact < 1.5 && accel_fact > 0.5))
   {
+    // Data didn't look sane, us a default.
     accel_fact = 1.0;
   }
 
@@ -439,14 +477,21 @@ void setup()
   // Set it to CTC mode so that we can configure its TOP value in OCR1A.
   TCCR1A = 0;
   TCCR1B = _BV(WGM12) | _BV(CS10);
-  TIMSK1 = _BV(OCIE1A);           // Enable (Timer 1 == OCR1A) interrupt.
-  // Have to set the TOP value after setting up the timer or it doesn't take
+  // Enable (Timer 1 == OCR1A) interrupt.
+  TIMSK1 = _BV(OCIE1A);
+  // Have to set the TOP value *after* setting up the timer or it doesn't take
   // effect.
   OCR1A = TICKS_PER_LOOP;
 
   // Enable interrupts
   sei();
 }
+
+/**
+ * The standard loop function, called repeatedly.  Most of the heavy lifting is
+ * done by the interrupt routine above.  We only use the loop function to read
+ * from serial.
+ */
 void loop()
 {
   int c = Serial.read();
