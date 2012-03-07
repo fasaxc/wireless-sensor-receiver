@@ -21,7 +21,7 @@
 #include <util/atomic.h>
 #include <EEPROM.h>
 
-#define TARGET_LOOP_HZ (1000)
+#define TARGET_LOOP_HZ (500)
 #define TICKS_PER_LOOP (F_CPU / TARGET_LOOP_HZ)
 #define TICK_SECONDS (1.0 / TARGET_LOOP_HZ)
 
@@ -157,9 +157,6 @@ static float y_filt_gs = 0;
 static float tilt_rads_estimate = 0;
 // Integral of tilt.
 static float tilt_int_rads = 0;
-// Estimates of velocity and displacement.
-static float v_m_per_sec = 0;
-static float displacement = 0;
 // Calculated speed.
 static float speed = 0;
 // Individual speeds applied to each motor.
@@ -224,19 +221,12 @@ ISR(TIMER1_COMPA_vect)
   // of this below.
   float accel_tilt_estimate = asin(max(min(x_filt_gs, 1.0), -1.0)) + accel_rotation;
 
-  v_m_per_sec *= 0.999;
-  v_m_per_sec += (accel_tilt_estimate * 9.8 * TICK_SECONDS);
-  displacement *= 0.99;
-  displacement += v_m_per_sec * TICK_SECONDS;
-
   float gs_sq = (x_gs * x_gs + y_gs * y_gs);
   total_gs_sq[gs_idx++] = abs(1.0 - gs_sq * accel_fact * accel_fact);
   if (gs_idx == NUM_G_SQ)
   {
     gs_idx = 0;
   }
-
-  float max_gs_sq = 0;
 
   static long int num_cal_readings;
   static float sum_gyro;
@@ -296,8 +286,6 @@ ISR(TIMER1_COMPA_vect)
     {
       tilt_rads_estimate = accel_tilt_estimate;
       speed = 0;
-      v_m_per_sec = 0;
-      displacement = 0;
       tilt_int_rads = 0;
       reset_complete = true;
     }
@@ -311,10 +299,7 @@ ISR(TIMER1_COMPA_vect)
 
 #define D_TILT_FACT 200.0
 #define TILT_FACT 5000.0
-#define TILT_SQ_FACT 50000.0
 #define TILT_INT_FACT 50000.0
-#define V_FACT 0 // 100.0
-#define DISPLACEMENT_FACT 0 // 10000.0
 
 #define MAX_TILT_INT (0.015)
 
@@ -327,17 +312,9 @@ ISR(TIMER1_COMPA_vect)
       tilt_int_rads = -MAX_TILT_INT;
     }
 
-#define DISPLACEMENT_OFFSET 0.15
-    float displacement_fact = min(1.0,
-                                  abs(displacement) < DISPLACEMENT_OFFSET ?
-                                      0 :
-                                      (abs(displacement) - DISPLACEMENT_OFFSET));
     speed = tilt_rads_estimate * TILT_FACT +
-            tilt_rads_estimate * abs(tilt_rads_estimate) * TILT_SQ_FACT +
             tilt_int_rads * TILT_INT_FACT +
-            gyro_rads_per_sec * D_TILT_FACT +
-            v_m_per_sec * V_FACT * displacement_fact +
-            displacement * displacement_fact * DISPLACEMENT_FACT;
+            gyro_rads_per_sec * D_TILT_FACT;
 
     if (TCNT1 > max_timer)
     {
@@ -356,10 +333,6 @@ ISR(TIMER1_COMPA_vect)
     Serial.print(tilt_rads_estimate, 4);
     Serial.print("\t");
     Serial.print(tilt_int_rads, 4);
-    Serial.print("\t");
-    Serial.print(v_m_per_sec, 4);
-    Serial.print("\t");
-    Serial.print(displacement);
     Serial.print("\t");
     Serial.print(speed);
     Serial.print('\n');
@@ -425,7 +398,7 @@ ISR(TIMER1_COMPA_vect)
   {
     calibration_counter--;
   }
-  if (TCNT1 > TICKS_PER_LOOP)
+  if (bit_is_set(TIFR1, OCF1A))
   {
     // This loop took too long and the timer wrapped.  That means that our
     // timing will be incorrect.
@@ -499,12 +472,6 @@ void loop()
   int c = Serial.read();
   if (c == 'g')
   {
-    Serial.print("Gyro offset: ");
-    Serial.print(gyro_offset, 4);
-    Serial.print('\n');
-    Serial.print("Accel fact: ");
-    Serial.print(accel_fact, 4);
-    Serial.print('\n');
     write_gyro = true;
   }
 }
