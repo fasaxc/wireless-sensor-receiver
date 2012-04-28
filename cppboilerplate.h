@@ -3,6 +3,7 @@
 #define INCLUDED_CPP_BOILERPLATE
 
 #include <stdlib.h>
+#include <avr/interrupt.h>
 
 extern "C" void __cxa_pure_virtual()
 {
