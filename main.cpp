@@ -42,7 +42,7 @@ ISR(TIMER1_COMPA_vect)
 
 // Number of timer ticks per half-bit of manchester encoding.  From spreadsheet
 // at https://docs.google.com/spreadsheet/ccc?key=0AkaHr7xXc1PldDFmZnowZ29nTWVNV2U1ZVRqbVlfSWc
-#define TICKS_PER_LOOP 6666
+#define TICKS_PER_LOOP 26664
 
 static volatile bool packet_available;
 
@@ -84,13 +84,13 @@ void loop()
         sei();
 
         // Write the data to the console.
-        Serial.print(packet.node_id);
+        Serial.print(packet.node_id, HEX);
         Serial.print(' ');
-        Serial.print(packet.seq_no);
+        Serial.print(packet.seq_no, DEC);
         Serial.print(' ');
         Serial.print(packet.reading_type);
         Serial.print(' ');
-        Serial.print(packet.reading);
+        Serial.print(packet.reading, HEX);
         Serial.print('\n');
     }
 }
@@ -104,7 +104,7 @@ typedef enum {
 static rx_state_t rx_state = rx_state_sync;
 
 #define RX_PIN 7
-#define SYNC_PATTERN 0xAAA9
+#define SYNC_PATTERN 0x55AA
 
 inline void take_sample()
 {
@@ -113,17 +113,20 @@ inline void take_sample()
     static uint8_t write_idx;
     static uint8_t write_bit_idx;
     char sample = digitalRead(RX_PIN);
+    Serial.print(sample ? '1' : '0');
+
+    recent_samples <<= 1;
+    recent_samples |= sample ? 1 : 0;
 
     if (rx_state == rx_state_sync)
     {
         // Waiting for the next packet, which starts with an alternating
         // sync pattern. Keep track of the last 16 samples and check for the
         // sync pattern.
-        recent_samples <<= 1;
-        recent_samples |= sample ? 1 : 0;
         if (recent_samples == SYNC_PATTERN)
         {
             // Found the sync pattern, the next bit should be data.
+            Serial.println("SYNC");
             recent_samples = 0;
             rx_state = rx_state_first_half_bit;
             write_bit_idx = 0;
@@ -135,10 +138,12 @@ inline void take_sample()
         // Read the first half of a Manchester-encoded bit.  We don't process
         // it until we get the second half of the bit.
         first_half_bit = sample;
+        rx_state = rx_state_second_half_bit;
     }
     else if (rx_state == rx_state_second_half_bit)
     {
         // Read the second half of the bit.
+        rx_state = rx_state_first_half_bit;
         if (first_half_bit && !sample)
         {
             // High then low, a Manchester-encoded 1-bit.
@@ -153,20 +158,24 @@ inline void take_sample()
         {
             // Error, the first and second half of the bits should always be
             // different.  Abandon the packet.
+            Serial.println("ERROR");
             rx_state = rx_state_sync;
             return;
         }
 
         write_bit_idx += 1;
-        if (write_bit_idx == 8)
+        if (write_bit_idx >= 8)
         {
             // We've received a whole byte, move to the next one.
+            Serial.print("BYTE ");
+            Serial.println((int)manchester.raw_data[write_idx]);
             write_bit_idx = 0;
             write_idx += 1;
             if (write_idx >= sizeof(manchester_data_t))
             {
                 // We've received a whole packet.  Process the packet and
                 // return to the sync state to wait for a new one.
+                Serial.print("\n*PACK*\n");
                 write_idx = 0;
                 rx_state = rx_state_sync;
                 packet_available = true;
