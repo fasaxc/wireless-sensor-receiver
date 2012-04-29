@@ -22,7 +22,7 @@
 #include <avr/interrupt.h>
 #include <sensor_node.h>
 
-inline void take_sample();
+inline void take_sample(uint16_t time, bool rising_edge);
 
 static union {
     manchester_data_t data;
@@ -35,14 +35,21 @@ static union {
  *
  * The timer is automatically reset to 0 after it hits OCR1A.
  */
-ISR(TIMER1_COMPA_vect)
+ISR(TIMER1_CAPT_vect)
 {
-    take_sample();
+    /* Reset the counter. */
+    TCNT1 = 0;
+    /* Read the CC value ASAP. */
+    uint16_t time = ICR1;
+    /* Then, switch to looking for the opposite edge. */
+    bool rising_edge = TCCR1B & _BV(ICES1);
+    TCCR1B ^= _BV(ICES1);
+    take_sample(time, rising_edge);
 }
 
 // Number of timer ticks per half-bit of manchester encoding.  From spreadsheet
 // at https://docs.google.com/spreadsheet/ccc?key=0AkaHr7xXc1PldDFmZnowZ29nTWVNV2U1ZVRqbVlfSWc
-#define TICKS_PER_LOOP 26664
+#define TICKS_PER_LOOP (16000)
 
 static volatile bool packet_available;
 
@@ -53,15 +60,14 @@ void setup()
 {
   Serial.begin(115200);
 
-  // We use Timer 1 as our accurate timebase.
-  // Set it to CTC mode so that we can configure its TOP value in OCR1A.
+  pinMode(8, INPUT);
+
+  // We use Timer 1 as input capture compare.
   TCCR1A = 0;
-  TCCR1B = _BV(WGM12) | _BV(CS10) /* Clock-select full speed */;
-  // Enable (Timer 1 == OCR1A) interrupt.
-  TIMSK1 = _BV(OCIE1A);
-  // Have to set the TOP value *after* setting up the timer or it doesn't take
-  // effect.
-  OCR1A = TICKS_PER_LOOP;
+  TCCR1B = _BV(ICNC1) /* Input capture noise canceler enabled */ |
+           _BV(CS10)  /* Timer enabled, full clock speed. */;
+  // Enable timer1 capture interrupt.
+  TIMSK1 = _BV(ICIE1);
 
   // Enable interrupts
   sei();
@@ -84,104 +90,132 @@ void loop()
         sei();
 
         // Write the data to the console.
-        Serial.print(packet.node_id, HEX);
+        Serial.print((uint8_t)packet.node_id, HEX);
         Serial.print(' ');
-        Serial.print(packet.seq_no, DEC);
+        Serial.print((uint8_t)packet.seq_no, DEC);
         Serial.print(' ');
-        Serial.print(packet.reading_type);
+        Serial.print((uint8_t)packet.reading_type, HEX);
         Serial.print(' ');
-        Serial.print(packet.reading, HEX);
-        Serial.print('\n');
+        Serial.println(packet.reading, HEX);
     }
 }
 
 typedef enum {
+    rx_state_wait,
     rx_state_sync,
-    rx_state_first_half_bit,
-    rx_state_second_half_bit
+    rx_state_receive,
+    rx_state_receive_short
 } rx_state_t;
 
-static rx_state_t rx_state = rx_state_sync;
+static rx_state_t rx_state = rx_state_wait;
 
-#define RX_PIN 7
-#define SYNC_PATTERN 0x55AA
+#define RX_PIN 8
 
-inline void take_sample()
-{
-    static uint16_t recent_samples;
-    static char first_half_bit;
-    static uint8_t write_idx;
-    static uint8_t write_bit_idx;
-    char sample = digitalRead(RX_PIN);
-    Serial.print(sample ? '1' : '0');
+#define TIME_IS_1T(time) (time >  TICKS_PER_LOOP * 0.5 && \
+                          time < TICKS_PER_LOOP * 1.5)
 
-    recent_samples <<= 1;
-    recent_samples |= sample ? 1 : 0;
+#define TIME_IS_2T(time) (time >  TICKS_PER_LOOP * 1.5 && \
+                          time < TICKS_PER_LOOP * 2.5)
 
-    if (rx_state == rx_state_sync)
+#define MIN_PREAMBLE_LENGTH 16
+
+static uint8_t write_idx;
+static uint8_t write_bit_idx;
+
+inline void on_receive_reset() {
+    write_idx = 0;
+    write_bit_idx = 0;
+}
+
+inline void on_bit_received(bool bit) {
+    const uint8_t mask = (uint8_t)(1 << write_bit_idx);
+
+    manchester.raw_data[write_idx] &= ~mask;
+    if (bit) {
+        manchester.raw_data[write_idx] |= mask;
+    }
+
+    write_bit_idx += 1;
+    if (write_bit_idx >= 8)
     {
-        // Waiting for the next packet, which starts with an alternating
-        // sync pattern. Keep track of the last 16 samples and check for the
-        // sync pattern.
-        if (recent_samples == SYNC_PATTERN)
+        // We've received a whole byte, move to the next one.
+        write_bit_idx = 0;
+        write_idx += 1;
+        if (write_idx >= sizeof(manchester_data_t))
         {
-            // Found the sync pattern, the next bit should be data.
-            Serial.println("SYNC");
-            recent_samples = 0;
-            rx_state = rx_state_first_half_bit;
-            write_bit_idx = 0;
+            // We've received a whole packet.  Process the packet and
+            // return to the sync state to wait for a new one.
             write_idx = 0;
+            rx_state = rx_state_wait;
+            packet_available = true;
         }
     }
-    else if (rx_state == rx_state_first_half_bit)
-    {
-        // Read the first half of a Manchester-encoded bit.  We don't process
-        // it until we get the second half of the bit.
-        first_half_bit = sample;
-        rx_state = rx_state_second_half_bit;
-    }
-    else if (rx_state == rx_state_second_half_bit)
-    {
-        // Read the second half of the bit.
-        rx_state = rx_state_first_half_bit;
-        if (first_half_bit && !sample)
-        {
-            // High then low, a Manchester-encoded 1-bit.
-            manchester.raw_data[write_idx] |= (char)(1 << write_bit_idx);
-        }
-        else if (!first_half_bit && sample)
-        {
-            // Low then high, a Manchester-encoded 0-bit.
-            manchester.raw_data[write_idx] &= (char)~(1 << write_bit_idx);
-        }
-        else
-        {
-            // Error, the first and second half of the bits should always be
-            // different.  Abandon the packet.
-            Serial.println("ERROR");
-            rx_state = rx_state_sync;
-            return;
-        }
+}
 
-        write_bit_idx += 1;
-        if (write_bit_idx >= 8)
-        {
-            // We've received a whole byte, move to the next one.
-            Serial.print("BYTE ");
-            Serial.println((int)manchester.raw_data[write_idx]);
-            write_bit_idx = 0;
-            write_idx += 1;
-            if (write_idx >= sizeof(manchester_data_t))
-            {
-                // We've received a whole packet.  Process the packet and
-                // return to the sync state to wait for a new one.
-                Serial.print("\n*PACK*\n");
-                write_idx = 0;
-                rx_state = rx_state_sync;
-                packet_available = true;
-                cli();
-            }
+inline void take_sample(uint16_t time, bool rising_edge)
+{
+    static uint8_t sync_bit_count;
+    static bool last_bit;
+
+    if (rx_state == rx_state_wait) {
+        // Waiting for the first change of bit.  The timer value will be
+        // garbage.
+        if (!rising_edge) {
+            // Got a falling edge, let's begin.
+            rx_state = rx_state_sync;
+            sync_bit_count = 0;
+            on_receive_reset();
         }
+    } else if (rx_state == rx_state_sync) {
+        // Looking for the sync pattern, which consists of many 1T transitions
+        // followed by one 2T transition.
+        if (TIME_IS_1T(time)) {
+            // Short pulse, just keep counting.
+            sync_bit_count++;
+            //Serial.print('.');
+        } else if (TIME_IS_2T(time)) {
+            if (sync_bit_count > MIN_PREAMBLE_LENGTH) {
+                // We've seen plenty of 1T transitions and now a 2T one.  Looks
+                // like we've got a packet.
+                //Serial.println("SYNC");
+                rx_state = rx_state_receive;
+                last_bit = 0;
+            }
+        } else {
+            // Error, transition time not in acceptable range.
+            rx_state = rx_state_wait;
+            //Serial.print(time < TICKS_PER_LOOP ? '<' : '>');
+        }
+    } else if (rx_state == rx_state_receive) {
+        if (TIME_IS_1T(time)) {
+            // Short pulse, this bit must be the same as the last bit.  We
+            // expect another short pulse after this.
+            rx_state = rx_state_receive_short;
+            //Serial.print('s');
+        } else if (TIME_IS_2T(time)) {
+            // Long pulse, this bit must be opposite to previous bit.
+            last_bit = !last_bit;
+            on_bit_received(last_bit);
+            //Serial.print('l');
+        } else {
+            // Error, transition time not in acceptable range.
+            //Serial.print('E');
+            rx_state = rx_state_wait;
+        }
+    } else if (rx_state == rx_state_receive_short) {
+        // We received a short pulse, absorb the following short pulse.
+        if (TIME_IS_1T(time)) {
+            // Got the expected short pulse.
+            on_bit_received(last_bit);
+            rx_state = rx_state_receive;
+            //Serial.print('S');
+        } else {
+            // Error, transition time not in acceptable range.
+            rx_state = rx_state_wait;
+            //Serial.print('E');
+        }
+    } else {
+        rx_state = rx_state_wait;
     }
 }
 
