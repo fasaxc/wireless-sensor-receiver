@@ -93,7 +93,11 @@ void loop()
         Serial.print(' ');
         Serial.print((uint8_t)packet.reading_type, HEX);
         Serial.print(' ');
-        Serial.print(packet.reading, HEX);
+
+        float t_mv = packet.reading * 1100.0 / 1024.0;
+        float t = 25 + ((t_mv - 750.0) / 10.0);
+
+        Serial.print(t, 2);
         Serial.print(' ');
         Serial.print(packet.checksum, HEX);
         Serial.print(' ');
