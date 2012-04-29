@@ -24,11 +24,6 @@
 
 inline void take_sample(uint16_t time, bool rising_edge);
 
-static union {
-    manchester_data_t data;
-    char raw_data[sizeof(manchester_data_t)];
-} manchester;
-
 /**
  * (Timer 1 == OCR1A) interrupt handler.  Called each time timer 1 hits the top
  * value we set in OCR1A at start of day.
@@ -49,7 +44,7 @@ ISR(TIMER1_CAPT_vect)
 
 // Number of timer ticks per half-bit of manchester encoding.  From spreadsheet
 // at https://docs.google.com/spreadsheet/ccc?key=0AkaHr7xXc1PldDFmZnowZ29nTWVNV2U1ZVRqbVlfSWc
-#define TICKS_PER_LOOP (16000)
+#define TICKS_PER_LOOP (8000)
 
 static volatile bool packet_available;
 
@@ -85,9 +80,11 @@ void loop()
         // Copy the packet from the input buffer to a local one, then reenable
         // the timer interrupt.
         manchester_data_t packet;
-        memcpy(&packet, &manchester, sizeof(manchester_data_t));
+        memcpy(&packet, &manchester_union, sizeof(manchester_data_t));
         packet_available = false;
         sei();
+
+        uint8_t checksum = calculate_checksum(&packet);
 
         // Write the data to the console.
         Serial.print((uint8_t)packet.node_id, HEX);
@@ -96,7 +93,11 @@ void loop()
         Serial.print(' ');
         Serial.print((uint8_t)packet.reading_type, HEX);
         Serial.print(' ');
-        Serial.println(packet.reading, HEX);
+        Serial.print(packet.reading, HEX);
+        Serial.print(' ');
+        Serial.print(packet.checksum, HEX);
+        Serial.print(' ');
+        Serial.println(checksum, HEX);
     }
 }
 
@@ -130,9 +131,9 @@ inline void on_receive_reset() {
 inline void on_bit_received(bool bit) {
     const uint8_t mask = (uint8_t)(1 << write_bit_idx);
 
-    manchester.raw_data[write_idx] &= ~mask;
+    manchester_union.manchester_data[write_idx] &= ~mask;
     if (bit) {
-        manchester.raw_data[write_idx] |= mask;
+        manchester_union.manchester_data[write_idx] |= mask;
     }
 
     write_bit_idx += 1;
