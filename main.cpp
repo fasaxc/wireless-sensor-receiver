@@ -25,10 +25,8 @@
 inline void take_sample(uint16_t time, bool rising_edge);
 
 /**
- * (Timer 1 == OCR1A) interrupt handler.  Called each time timer 1 hits the top
- * value we set in OCR1A at start of day.
- *
- * The timer is automatically reset to 0 after it hits OCR1A.
+ * Timer1 capture/compare interrupt handler.  Triggered when the input pin
+ * toggles.  We use the timer to time how long the input pin was high or low.
  */
 ISR(TIMER1_CAPT_vect)
 {
@@ -69,9 +67,8 @@ void setup()
 }
 
 /**
- * The standard loop function, called repeatedly.  Most of the heavy lifting is
- * done by the interrupt routine above.  We only use the loop function to read
- * from serial.
+ * The standard loop function, called repeatedly.  If the interrupt routine has
+ * captured a packet then we take a copy and write the data to the serial port.
  */
 void loop()
 {
@@ -116,6 +113,8 @@ static rx_state_t rx_state = rx_state_wait;
 
 #define RX_PIN 8
 
+/* These macros are used to distinguish long and short pulses.  I.e. whether
+ * the signal has been high/low for 1 time period or 2. */
 #define TIME_IS_1T(time) (time >  TICKS_PER_LOOP * 0.5 && \
                           time < TICKS_PER_LOOP * 1.5)
 
@@ -157,6 +156,20 @@ inline void on_bit_received(bool bit) {
     }
 }
 
+/**
+ * State machine for decoding the Manchester-encoded data.
+ *
+ * - Starts in wait state and returns there if any decoding errors occur.
+ * - Moves to sync state when a transition is detected, reads the sync pulse
+ *   at the start of the packet.
+ * - If a valid sync is detected, moves to receive state, which reads out the
+ *   bits of the packet.
+ * - When receive state detects a short pulse it expects a following short
+ *   pulse so it moves to receive_short to ignore that extra short pulse.
+ *
+ * Receive feeds bits to the on_bit_received function, which reconstructs the
+ * packet.
+ */
 inline void take_sample(uint16_t time, bool rising_edge)
 {
     static uint8_t sync_bit_count;
